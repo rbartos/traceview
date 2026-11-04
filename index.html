@@ -1,0 +1,108 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="theme-color" content="#10151c">
+    <title>Traceview — Packet Analyzer</title>
+    <link rel="stylesheet" href="./styles.css">
+  </head>
+  <body>
+    <header class="topbar">
+      <a class="brand" href="#" aria-label="Traceview home">
+        <span class="brand-mark" aria-hidden="true">⌁</span>
+        <span>trace<span class="brand-accent">view</span></span>
+      </a>
+      <span class="topbar-caption">PACKET ANALYZER</span>
+      <div class="topbar-actions">
+        <select class="button button-quiet" id="sample-select" aria-label="Open sample capture" disabled>
+          <option value="">Loading samples…</option>
+        </select>
+        <label class="button button-primary" for="file-input">＋ <span>Open capture</span></label>
+        <input id="file-input" type="file" accept=".pcap,.pcapng,application/vnd.tcpdump.pcap,application/x-pcapng" hidden>
+        <button class="button button-quiet" id="about-button" type="button">About</button>
+      </div>
+    </header>
+
+    <main>
+      <section class="welcome" id="welcome">
+        <div class="welcome-icon" aria-hidden="true">
+          <svg viewBox="0 0 48 48" fill="none"><path d="M5 25h9l5-13 10 25 5-12h10" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/><circle cx="19" cy="12" r="2" fill="currentColor"/><circle cx="29" cy="37" r="2" fill="currentColor"/></svg>
+        </div>
+        <div class="eyebrow">PACKET INSPECTION, IN YOUR BROWSER</div>
+        <h1>Every packet tells<br>you <span>something.</span></h1>
+        <p>Open a capture to inspect packets, protocols, and payloads.<br>Your file stays on your device.</p>
+        <div class="welcome-actions">
+          <label class="button button-primary button-large" for="file-input">＋ <span>Choose a .pcap or .pcapng file</span></label>
+          <button class="button button-secondary button-large" id="welcome-sample" type="button">Explore sample trace <span aria-hidden="true">→</span></button>
+        </div>
+        <div class="support-note"><span class="status-dot"></span> Ethernet · IPv4 · IPv6 · UDP · TCP · ARP · DNS · HTTP</div>
+      </section>
+
+      <section class="workspace" id="workspace" hidden>
+        <div class="capture-bar">
+          <div class="capture-file">
+            <span class="file-icon" aria-hidden="true">▤</span>
+            <div><strong id="capture-name">Capture</strong><span id="capture-meta"></span></div>
+          </div>
+          <div class="capture-actions">
+            <button id="clear-filter" class="text-button" type="button">Clear filter</button>
+            <button class="button button-quiet button-small" id="change-capture" type="button">Open another</button>
+          </div>
+        </div>
+        <div class="filterbar">
+          <span class="filter-icon" aria-hidden="true">⌕</span>
+          <input id="display-filter" type="search" placeholder="Apply a display filter…  try  tcp, http, ipv6, or arp" autocomplete="off" spellcheck="false" aria-label="Display filter">
+          <kbd>↵</kbd>
+          <span class="filter-hint">DISPLAY FILTER</span>
+        </div>
+        <div class="quick-filters" aria-label="Quick protocol filters">
+          <button class="filter-chip active" type="button" data-filter="">All packets</button>
+          <button class="filter-chip" type="button" data-filter="tcp">TCP</button>
+          <button class="filter-chip" type="button" data-filter="udp">UDP</button>
+          <button class="filter-chip" type="button" data-filter="http">HTTP</button>
+          <button class="filter-chip" type="button" data-filter="dns">DNS</button>
+          <button class="filter-chip" type="button" data-filter="ipv4">IPv4</button>
+          <button class="filter-chip" type="button" data-filter="ipv6">IPv6</button>
+          <button class="filter-chip" type="button" data-filter="arp">ARP</button>
+          <button class="filter-chip" type="button" data-filter="icmp">ICMP</button>
+          <button class="filter-chip" type="button" data-filter="icmpv6">ICMPv6</button>
+          <span class="packet-count" id="packet-count"></span>
+        </div>
+
+        <div class="packet-table-wrap">
+          <table class="packet-table">
+            <thead><tr>
+              <th class="col-no">No.</th><th class="col-time">Time</th><th class="col-source">Source</th>
+              <th class="col-destination">Destination</th><th class="col-protocol">Protocol</th>
+              <th class="col-length">Length</th><th>Info</th>
+            </tr></thead>
+            <tbody id="packet-rows"></tbody>
+          </table>
+          <div id="empty-filter" class="empty-filter" hidden>No packets match this filter.</div>
+        </div>
+
+        <div class="inspectors">
+          <section class="inspector protocol-inspector">
+            <div class="panel-heading"><span>PACKET DETAILS</span><span id="packet-selection" class="panel-shortcut">Select a packet to inspect</span></div>
+            <div id="packet-details" class="details-content"><div class="inspector-empty">Select a packet in the list above.</div></div>
+          </section>
+          <section class="inspector bytes-inspector">
+            <div class="panel-heading"><span>PACKET BYTES</span><span id="bytes-length" class="panel-shortcut"></span></div>
+            <div id="packet-bytes" class="bytes-content"><div class="inspector-empty">Raw bytes will appear here.</div></div>
+          </section>
+        </div>
+      </section>
+      <div id="error-message" class="error-message" role="alert" hidden></div>
+    </main>
+    <dialog class="about-dialog" id="about-dialog" aria-labelledby="about-title">
+      <div class="about-heading">
+        <h2 id="about-title">About Traceview</h2>
+        <button class="button button-quiet button-small" id="about-close" type="button">Close</button>
+      </div>
+      <pre class="about-content" id="about-content" aria-live="polite">Loading README.md…</pre>
+    </dialog>
+    <footer class="footer"><span>TRACEVIEW</span><span>Captures are processed locally — nothing is uploaded.</span></footer>
+    <script type="module" src="./app.mjs"></script>
+  </body>
+</html>
