@@ -13,6 +13,8 @@ const PCAP_FORMATS = {
   "161,178,60,77": { littleEndian: false, timestampScale: 1e-9 },
 };
 
+const tcpSegments = new WeakMap();
+
 const protocolNames = {
   1: "ICMP",
   6: "TCP",
@@ -101,6 +103,10 @@ function readHttp(payload) {
       ...(headerEnd >= 0 && text.length > headerEnd + 4 ? [field("Body", `${text.length - headerEnd - 4} bytes`)] : []),
     ],
   };
+}
+
+function tlsRecordTypeName(type) {
+  return ({ 20: "Change Cipher Spec", 21: "Alert", 22: "Handshake", 23: "Application Data" })[type] || `Content type ${type}`;
 }
 
 const dnsTypes = {
@@ -483,6 +489,7 @@ function parseTransport(bytes, offset, end, protocol, context) {
   const payload = bytes.subarray(payloadStart, Math.max(payloadStart, payloadEnd));
   const isTcp = protocol === 6;
   const label = isTcp ? "TCP" : "UDP";
+  const isTls = isTcp && payload.length >= 5 && payload[1] === 3 && [20, 21, 22, 23].includes(payload[0]);
   const dns = (sourcePort === 53 || destinationPort === 53) ? parseDns(payload, isTcp) : null;
   const flags = isTcp ? bytes[offset + 13] : 0;
   const flagNames = [];
@@ -541,11 +548,33 @@ function parseTransport(bytes, offset, end, protocol, context) {
   };
   context.layers.push(transport);
   if (dns) context.layers.push({ name: "Domain Name System", summary: dns.summary, fields: dns.fields });
+  const tlsRecordLength = isTls ? view.getUint16(payloadStart + 3) : 0;
+  if (isTls) {
+    context.layers.push({
+      name: "Transport Layer Security",
+      summary: `${tlsRecordTypeName(payload[0])}, TLS ${payload[1]}.${payload[2]}`,
+      fields: [
+        field("Content type", tlsRecordTypeName(payload[0])),
+        field("Record version", `TLS ${payload[1]}.${payload[2]}`),
+        field("Record length", `${tlsRecordLength} bytes`),
+      ],
+    });
+  }
+  const tcpSegment = isTcp ? {
+    sourcePort,
+    destinationPort,
+    sequence: view.getUint32(offset + 4),
+    flags,
+    payload,
+  } : null;
   return {
-    protocol: dns ? "DNS" : http ? "HTTP" : label,
-    info,
+    protocol: dns ? "DNS" : http ? "HTTP" : isTls ? "TLS" : label,
+    info: isTls && !dns && !http
+      ? `${sourcePort} → ${destinationPort} ${tlsRecordTypeName(payload[0])} (${tlsRecordLength} bytes)`
+      : info,
     http,
-    filterTokens: [label.toLowerCase(), isTcp ? "tcp" : "udp", ...(dns ? ["dns"] : []), ...(http ? ["http"] : [])],
+    tcpSegment,
+    filterTokens: [label.toLowerCase(), isTcp ? "tcp" : "udp", ...(dns ? ["dns"] : []), ...(http ? ["http"] : []), ...(isTls ? ["tls"] : [])],
   };
 }
 
@@ -653,6 +682,7 @@ function parsePacket(packetBytes, originalLength, time, number, interfaceInfo) {
       result.protocol = transport.protocol;
       result.info = transport.info;
       result.filterTokens.push(...transport.filterTokens);
+      if (transport.tcpSegment) tcpSegments.set(result, { source: sourceIP, destination: destinationIP, ...transport.tcpSegment });
       if (transport.http) layers.push({ name: "Hypertext Transfer Protocol", summary: transport.http.summary, fields: transport.http.fields });
     } else if (protocolNumber === 1) {
       const icmp = parseIcmp(bytes, transportOffset, ipEnd, 4);
@@ -707,6 +737,7 @@ function parsePacket(packetBytes, originalLength, time, number, interfaceInfo) {
       result.protocol = transport.protocol;
       result.info = transport.info;
       result.filterTokens.push(...transport.filterTokens);
+      if (transport.tcpSegment) tcpSegments.set(result, { source: sourceIP, destination: destinationIP, ...transport.tcpSegment });
       if (transport.http) layers.push({ name: "Hypertext Transfer Protocol", summary: transport.http.summary, fields: transport.http.fields });
     } else if (nextHeader === 58) {
       const icmp = parseIcmp(bytes, transportOffset, ipEnd, 6);
@@ -726,10 +757,11 @@ function parsePacket(packetBytes, originalLength, time, number, interfaceInfo) {
   return result;
 }
 
-export function parsePcapng(input) {
+function parsePcapngInternal(input, { includeSecrets = false } = {}) {
   const bytes = input instanceof Uint8Array ? input : new Uint8Array(input);
   const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
   const packets = [];
+  let tlsKeyLog = "";
   let offset = 0;
   let littleEndian = true;
   let interfaces = [];
@@ -772,6 +804,18 @@ export function parsePcapng(input) {
         }
       });
       interfaces.push(interfaceInfo);
+    } else if (blockType === 0x0a) {
+      if (blockLength < 20) throw new Error("The capture contains an incomplete Decryption Secrets Block.");
+      const secretsType = view.getUint32(offset + 8, littleEndian);
+      const secretsLength = view.getUint32(offset + 12, littleEndian);
+      const secretsOffset = offset + 16;
+      const optionsOffset = secretsOffset + ((secretsLength + 3) & ~3);
+      assertRange(secretsOffset, secretsLength, offset + blockLength - 4, "decryption secrets");
+      if (includeSecrets && secretsType === 0x544c534b) {
+        tlsKeyLog += `${new TextDecoder("utf-8", { fatal: false }).decode(bytes.subarray(secretsOffset, secretsOffset + secretsLength))}\n`;
+      }
+      if (optionsOffset > offset + blockLength - 4) throw new Error("The capture contains an incomplete Decryption Secrets Block.");
+      readOptions(view, optionsOffset, offset + blockLength - 4, littleEndian, () => {});
     } else if (blockType === BLOCK.ENHANCED_PACKET || blockType === BLOCK.PACKET || blockType === BLOCK.SIMPLE_PACKET) {
       if (interfaces.length === 0) throw new Error("The capture contains a packet before any interface was defined.");
       let interfaceId = 0;
@@ -826,7 +870,638 @@ export function parsePcapng(input) {
   if (firstTimestamp !== null) {
     for (const packet of packets) packet.relativeTime = packet.time - firstTimestamp;
   }
-  return { packets, interfaceCount: interfaces.length };
+  return includeSecrets
+    ? { packets, interfaceCount: interfaces.length, tlsKeyLog }
+    : { packets, interfaceCount: interfaces.length };
+}
+
+export function parsePcapng(input) {
+  return parsePcapngInternal(input);
+}
+
+function bytesFromHex(value) {
+  const bytes = new Uint8Array(value.length / 2);
+  for (let i = 0; i < bytes.length; i++) bytes[i] = Number.parseInt(value.slice(i * 2, i * 2 + 2), 16);
+  return bytes;
+}
+
+function concatenateBytes(...parts) {
+  const output = new Uint8Array(parts.reduce((length, part) => length + part.length, 0));
+  let offset = 0;
+  for (const part of parts) {
+    output.set(part, offset);
+    offset += part.length;
+  }
+  return output;
+}
+
+function parseTlsKeyLog(text) {
+  const keys = new Map();
+  for (const line of text.split(/\r?\n/)) {
+    const match = /^\s*CLIENT_RANDOM\s+([0-9a-f]{64})\s+([0-9a-f]{96})\s*$/i.exec(line);
+    if (match) keys.set(match[1].toLowerCase(), bytesFromHex(match[2]));
+  }
+  return keys;
+}
+
+class TlsAuthenticationError extends Error {}
+
+function reassembleTcp(segments) {
+  if (!segments.length) return null;
+  const firstSequence = (segments[0].sequence + (segments[0].flags & 0x02 ? 1 : 0)) >>> 0;
+  const relative = segment => {
+    const sequence = (segment.sequence + (segment.flags & 0x02 ? 1 : 0)) >>> 0;
+    return (sequence - firstSequence) | 0;
+  };
+  const baseSegment = segments.reduce((earliest, segment) => relative(segment) < relative(earliest) ? segment : earliest);
+  const baseSequence = (baseSegment.sequence + (baseSegment.flags & 0x02 ? 1 : 0)) >>> 0;
+  const ordered = segments.map(segment => ({
+    segment,
+    offset: ((segment.sequence + (segment.flags & 0x02 ? 1 : 0)) - baseSequence) >>> 0,
+  })).sort((a, b) => a.offset - b.offset);
+  let buffer = new Uint8Array(0);
+  let streamLength = 0;
+  const spans = [];
+  for (const { segment, offset } of ordered) {
+    const payload = segment.payload;
+    if (offset > streamLength) break;
+    const overlap = Math.max(0, streamLength - offset);
+    if (overlap >= payload.length) continue;
+    const start = streamLength;
+    const addition = payload.subarray(overlap);
+    const requiredLength = streamLength + addition.length;
+    if (requiredLength > buffer.length) {
+      const capacity = Math.max(requiredLength, Math.max(1024, buffer.length * 2));
+      const expanded = new Uint8Array(capacity);
+      expanded.set(buffer);
+      buffer = expanded;
+    }
+    buffer.set(addition, streamLength);
+    streamLength = requiredLength;
+    spans.push({ start, end: streamLength, packet: segment.packet });
+  }
+  const bytes = buffer.subarray(0, streamLength);
+  return {
+    bytes,
+    packetAt(endOffset) {
+      return spans.find(span => endOffset > span.start && endOffset <= span.end)?.packet ?? spans.at(-1)?.packet;
+    },
+  };
+}
+
+function parseTlsRecords(stream) {
+  const records = [];
+  for (let offset = 0; offset + 5 <= stream.bytes.length;) {
+    const type = stream.bytes[offset];
+    if (![20, 21, 22, 23].includes(type) || stream.bytes[offset + 1] !== 3) break;
+    const length = (stream.bytes[offset + 3] << 8) | stream.bytes[offset + 4];
+    const end = offset + 5 + length;
+    if (length > 18_432 || end > stream.bytes.length) break;
+    records.push({
+      type,
+      version: stream.bytes.subarray(offset + 1, offset + 3),
+      body: stream.bytes.subarray(offset + 5, end),
+      packet: stream.packetAt(end),
+    });
+    offset = end;
+  }
+  return records;
+}
+
+const tlsHandshakeNames = {
+  0: "Hello Request",
+  1: "Client Hello",
+  2: "Server Hello",
+  4: "New Session Ticket",
+  8: "Encrypted Extensions",
+  11: "Certificate",
+  12: "Server Key Exchange",
+  13: "Certificate Request",
+  14: "Server Hello Done",
+  15: "Certificate Verify",
+  16: "Client Key Exchange",
+  20: "Finished",
+  24: "Key Update",
+};
+
+const tlsCipherSuiteNames = new Map([
+  [0x002f, "TLS_RSA_WITH_AES_128_CBC_SHA"],
+  [0x0035, "TLS_RSA_WITH_AES_256_CBC_SHA"],
+  [0x009c, "TLS_RSA_WITH_AES_128_GCM_SHA256"],
+  [0x009d, "TLS_RSA_WITH_AES_256_GCM_SHA384"],
+  [0x1301, "TLS_AES_128_GCM_SHA256"],
+  [0x1302, "TLS_AES_256_GCM_SHA384"],
+  [0x1303, "TLS_CHACHA20_POLY1305_SHA256"],
+  [0xc02b, "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256"],
+  [0xc02c, "TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384"],
+  [0xc02f, "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256"],
+  [0xc030, "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384"],
+]);
+
+const tlsExtensionNames = {
+  0: "Server Name",
+  5: "Status Request",
+  10: "Supported Groups",
+  11: "EC Point Formats",
+  13: "Signature Algorithms",
+  16: "Application-Layer Protocol Negotiation",
+  23: "Extended Master Secret",
+  35: "Session Ticket",
+  43: "Supported Versions",
+  45: "PSK Key Exchange Modes",
+  51: "Key Share",
+};
+
+const tlsNamedGroups = {
+  23: "secp256r1",
+  24: "secp384r1",
+  25: "secp521r1",
+  29: "x25519",
+  30: "x448",
+};
+
+function tlsVersionName(major, minor) {
+  return major === 3
+    ? ({ 0: "SSL 3.0", 1: "TLS 1.0", 2: "TLS 1.1", 3: "TLS 1.2", 4: "TLS 1.3" })[minor] || `TLS 3.${minor}`
+    : `${major}.${minor}`;
+}
+
+function tlsHex(bytes) {
+  return Array.from(bytes, byte => byte.toString(16).padStart(2, "0")).join("");
+}
+
+function readTlsExtensions(body, offset, isClientHello) {
+  if (offset + 2 > body.length) return null;
+  const end = offset + 2 + (body[offset] << 8 | body[offset + 1]);
+  if (end > body.length) return null;
+  const extensions = [];
+  for (let cursor = offset + 2; cursor + 4 <= end;) {
+    const type = body[cursor] << 8 | body[cursor + 1];
+    const length = body[cursor + 2] << 8 | body[cursor + 3];
+    cursor += 4;
+    if (cursor + length > end) return null;
+    const data = body.subarray(cursor, cursor + length);
+    const name = tlsExtensionNames[type] || `Extension ${type}`;
+    const children = [];
+    let value = `${length} bytes`;
+    if (type === 0 && data.length >= 5) {
+      const listEnd = 2 + (data[0] << 8 | data[1]);
+      const names = [];
+      for (let pos = 2; pos + 3 <= Math.min(listEnd, data.length);) {
+        const nameType = data[pos++];
+        const nameLength = data[pos] << 8 | data[pos + 1];
+        pos += 2;
+        if (pos + nameLength > data.length) break;
+        const hostname = new TextDecoder().decode(data.subarray(pos, pos + nameLength));
+        names.push(hostname);
+        children.push(field(nameType === 0 ? "Host name" : `Name type ${nameType}`, hostname));
+        pos += nameLength;
+      }
+      if (names.length) value = names.join(", ");
+    } else if (type === 16 && data.length >= 3) {
+      const listEnd = Math.min(data.length, 2 + (data[0] << 8 | data[1]));
+      const protocols = [];
+      for (let pos = 2; pos < listEnd;) {
+        const protocolLength = data[pos++];
+        if (!protocolLength || pos + protocolLength > listEnd) break;
+        const protocol = new TextDecoder().decode(data.subarray(pos, pos + protocolLength));
+        protocols.push(protocol);
+        children.push(field("Protocol", protocol));
+        pos += protocolLength;
+      }
+      if (protocols.length) value = protocols.join(", ");
+    } else if (type === 43) {
+      if (isClientHello && data.length >= 1) {
+        const listEnd = Math.min(data.length, 1 + data[0]);
+        const versions = [];
+        for (let pos = 1; pos + 1 < listEnd; pos += 2) {
+          const version = tlsVersionName(data[pos], data[pos + 1]);
+          versions.push(version);
+          children.push(field("Version", version));
+        }
+        if (versions.length) value = versions.join(", ");
+      } else if (data.length === 2) {
+        value = tlsVersionName(data[0], data[1]);
+      }
+    } else if ((type === 10 || type === 13) && data.length >= 2) {
+      const listEnd = Math.min(data.length, 2 + (data[0] << 8 | data[1]));
+      const values = [];
+      for (let pos = 2; pos + 1 < listEnd; pos += 2) {
+        const id = data[pos] << 8 | data[pos + 1];
+        const label = type === 10 ? (tlsNamedGroups[id] || `Group ${id}`) : `Algorithm 0x${id.toString(16).padStart(4, "0")}`;
+        values.push(label);
+        children.push(field(type === 10 ? "Group" : "Algorithm", label));
+      }
+      if (values.length) value = values.join(", ");
+    } else if (type === 51 && data.length >= 4) {
+      let pos = isClientHello ? 2 : 0;
+      const sharesEnd = isClientHello ? Math.min(data.length, 2 + (data[0] << 8 | data[1])) : data.length;
+      const shares = [];
+      while (pos + 4 <= sharesEnd) {
+        const group = data[pos] << 8 | data[pos + 1];
+        const keyLength = data[pos + 2] << 8 | data[pos + 3];
+        pos += 4;
+        if (pos + keyLength > sharesEnd) break;
+        const groupName = tlsNamedGroups[group] || `Group ${group}`;
+        shares.push(groupName);
+        children.push(field("Key share", `${groupName}, ${keyLength} bytes`));
+        pos += keyLength;
+        if (!isClientHello) break;
+      }
+      if (shares.length) value = shares.join(", ");
+    } else if ([23, 35].includes(type)) {
+      value = length ? `${length} bytes` : "Enabled";
+    }
+    extensions.push(field(name, value, children));
+    cursor += length;
+  }
+  return extensions;
+}
+
+function decodeTlsHandshake(type, body) {
+  const name = tlsHandshakeNames[type] || `Handshake type ${type}`;
+  let summary = name;
+  const fields = [];
+  if (type === 1 || type === 2) {
+    const isClientHello = type === 1;
+    if (body.length < 38) return null;
+    const version = tlsVersionName(body[0], body[1]);
+    const sessionLength = body[34];
+    let cursor = 35;
+    if (cursor + sessionLength > body.length) return null;
+    const sessionId = body.subarray(cursor, cursor + sessionLength);
+    cursor += sessionLength;
+    fields.push(
+      field("Legacy version", version),
+      field("Random", tlsHex(body.subarray(2, 34))),
+      field("Session ID", sessionId.length ? tlsHex(sessionId) : "Empty"),
+    );
+    if (isClientHello) {
+      if (cursor + 2 > body.length) return null;
+      const cipherLength = body[cursor] << 8 | body[cursor + 1];
+      cursor += 2;
+      if (!cipherLength || cipherLength % 2 || cursor + cipherLength > body.length) return null;
+      const cipherSuites = [];
+      for (let end = cursor + cipherLength; cursor < end; cursor += 2) {
+        const id = body[cursor] << 8 | body[cursor + 1];
+        const cipher = tlsCipherSuiteNames.get(id) || `Unknown (0x${id.toString(16).padStart(4, "0")})`;
+        cipherSuites.push(cipher);
+      }
+      fields.push(field("Cipher suites", `${cipherSuites.length} offered`, cipherSuites.map(cipher => field("Cipher suite", cipher))));
+      if (cursor >= body.length) return null;
+      const compressionLength = body[cursor++];
+      if (cursor + compressionLength > body.length) return null;
+      fields.push(field("Compression methods", Array.from(body.subarray(cursor, cursor + compressionLength), value => value === 0 ? "Null" : `Method ${value}`).join(", ") || "None"));
+      cursor += compressionLength;
+    } else {
+      if (cursor + 3 > body.length) return null;
+      const id = body[cursor] << 8 | body[cursor + 1];
+      const cipher = tlsCipherSuiteNames.get(id) || `Unknown (0x${id.toString(16).padStart(4, "0")})`;
+      cursor += 2;
+      const compression = body[cursor++];
+      fields.push(field("Selected cipher suite", cipher), field("Compression method", compression === 0 ? "Null" : `Method ${compression}`));
+      summary = `${name} (${cipher})`;
+    }
+    if (cursor < body.length) {
+      const extensions = readTlsExtensions(body, cursor, isClientHello);
+      if (extensions === null) return null;
+      if (extensions.length) fields.push(field("Extensions", `${extensions.length} extension${extensions.length === 1 ? "" : "s"}`, extensions));
+      if (type === 2) {
+        const selectedVersion = extensions.find(extension => extension.name === "Supported Versions");
+        if (selectedVersion) summary = `${name} (${selectedVersion.value})`;
+      }
+    }
+  } else if (type === 11) {
+    const tls12ListLength = body.length >= 3 ? body[0] << 16 | body[1] << 8 | body[2] : -1;
+    const tls13Certificate = tls12ListLength !== body.length - 3 && body.length >= 4 && body[0] + 4 <= body.length;
+    let cursor = tls13Certificate ? 1 + body[0] : 0;
+    if (cursor + 3 > body.length) return null;
+    const listLength = body[cursor] << 16 | body[cursor + 1] << 8 | body[cursor + 2];
+    cursor += 3;
+    const listEnd = Math.min(body.length, cursor + listLength);
+    const certificates = [];
+    while (cursor + 3 <= listEnd) {
+      const length = body[cursor] << 16 | body[cursor + 1] << 8 | body[cursor + 2];
+      cursor += 3;
+      if (!length || cursor + length > listEnd) break;
+      certificates.push(field(`Certificate ${certificates.length + 1}`, `${length} bytes`));
+      cursor += length;
+      if (tls13Certificate && cursor + 2 <= listEnd) {
+        const extensionLength = body[cursor] << 8 | body[cursor + 1];
+        if (cursor + 2 + extensionLength > listEnd) break;
+        cursor += 2 + extensionLength;
+      }
+    }
+    fields.push(field("Certificates", `${certificates.length} certificate${certificates.length === 1 ? "" : "s"}`, certificates));
+  } else if (type === 14) {
+    if (body.length) return null;
+    fields.push(field("Message", "No additional data"));
+  } else if (type === 20) {
+    fields.push(field("Verify data", `${body.length} bytes`, body.length ? [field("Value", tlsHex(body))] : []));
+  } else if (type === 16 || type === 12 || type === 15) {
+    fields.push(field(type === 16 ? "Exchange parameters" : type === 12 ? "Key exchange parameters" : "Certificate verification data", `${body.length} bytes`));
+  } else if (type === 4) {
+    fields.push(field("Ticket data", `${body.length} bytes`));
+  } else if (type === 24) {
+    fields.push(field("Requested update", body[0] === 1 ? "Request peer update" : "Update not requested"));
+  } else if (type === 8) {
+    const extensions = readTlsExtensions(body, 0, false);
+    if (extensions === null) return null;
+    fields.push(field("Extensions", `${extensions.length} extension${extensions.length === 1 ? "" : "s"}`, extensions));
+  } else if (type !== 0) {
+    fields.push(field("Handshake body", `${body.length} bytes`));
+  }
+  if (!fields.length) fields.push(field("Handshake body", `${body.length} bytes`));
+  return { name, summary, fields };
+}
+
+function decodeTlsHandshakes(records) {
+  const messages = [];
+  let pending = new Uint8Array(0);
+  for (const record of records) {
+    if (record.type === 20) break;
+    if (record.type !== 22 || !record.body.length) continue;
+    pending = concatenateBytes(pending, record.body);
+    let offset = 0;
+    while (offset + 4 <= pending.length) {
+      const type = pending[offset];
+      const length = pending[offset + 1] << 16 | pending[offset + 2] << 8 | pending[offset + 3];
+      if (offset + 4 + length > pending.length) break;
+      const decoded = decodeTlsHandshake(type, pending.subarray(offset + 4, offset + 4 + length));
+      if (decoded) messages.push({ ...decoded, packet: record.packet });
+      offset += 4 + length;
+    }
+    pending = pending.slice(offset);
+  }
+  return messages;
+}
+
+function readTlsHello(records, expectedType) {
+  const handshake = [];
+  for (const record of records) {
+    if (record.type === 20) break;
+    if (record.type === 22) handshake.push(...record.body);
+  }
+  for (let offset = 0; offset + 4 <= handshake.length;) {
+    const type = handshake[offset];
+    const length = (handshake[offset + 1] << 16) | (handshake[offset + 2] << 8) | handshake[offset + 3];
+    const end = offset + 4 + length;
+    if (end > handshake.length) break;
+    if (type === expectedType && length >= 38) {
+      const body = handshake.slice(offset + 4, end);
+      const random = Uint8Array.from(body.slice(2, 34));
+      if (expectedType === 1) return { random };
+      const sessionIdLength = body[34];
+      const cipherOffset = 35 + sessionIdLength;
+      if (cipherOffset + 2 <= body.length) return { random, cipherSuite: (body[cipherOffset] << 8) | body[cipherOffset + 1] };
+    }
+    offset = end;
+  }
+  return null;
+}
+
+const tls12GcmSuites = new Map([
+  [0x009c, { keyLength: 16, hash: "SHA-256" }],
+  [0x009d, { keyLength: 32, hash: "SHA-384" }],
+  [0xc02b, { keyLength: 16, hash: "SHA-256" }],
+  [0xc02c, { keyLength: 32, hash: "SHA-384" }],
+  [0xc02f, { keyLength: 16, hash: "SHA-256" }],
+  [0xc030, { keyLength: 32, hash: "SHA-384" }],
+]);
+
+async function hmac(subtle, key, data, hash) {
+  const cryptoKey = await subtle.importKey("raw", key, { name: "HMAC", hash }, false, ["sign"]);
+  return new Uint8Array(await subtle.sign("HMAC", cryptoKey, data));
+}
+
+async function tlsPrf(subtle, secret, label, seed, length, hash) {
+  const labelAndSeed = concatenateBytes(new TextEncoder().encode(label), seed);
+  let a = labelAndSeed;
+  const output = [];
+  let outputLength = 0;
+  while (outputLength < length) {
+    a = await hmac(subtle, secret, a, hash);
+    const block = await hmac(subtle, secret, concatenateBytes(a, labelAndSeed), hash);
+    output.push(block);
+    outputLength += block.length;
+  }
+  return concatenateBytes(...output).subarray(0, length);
+}
+
+async function deriveTls12Keys(subtle, masterSecret, clientRandom, serverRandom, suite) {
+  const keyBlockLength = 2 * suite.keyLength + 8;
+  const keyBlock = await tlsPrf(
+    subtle,
+    masterSecret,
+    "key expansion",
+    concatenateBytes(serverRandom, clientRandom),
+    keyBlockLength,
+    suite.hash,
+  );
+  let offset = 0;
+  const clientKeyBytes = keyBlock.slice(offset, offset += suite.keyLength);
+  const serverKeyBytes = keyBlock.slice(offset, offset += suite.keyLength);
+  const clientIv = keyBlock.slice(offset, offset += 4);
+  const serverIv = keyBlock.slice(offset, offset + 4);
+  return {
+    clientKey: await subtle.importKey("raw", clientKeyBytes, { name: "AES-GCM" }, false, ["decrypt"]),
+    serverKey: await subtle.importKey("raw", serverKeyBytes, { name: "AES-GCM" }, false, ["decrypt"]),
+    clientIv,
+    serverIv,
+  };
+}
+
+function uint64Bytes(value) {
+  const bytes = new Uint8Array(8);
+  new DataView(bytes.buffer).setBigUint64(0, value);
+  return bytes;
+}
+
+function getTlsLayer(packet) {
+  let layer = packet.layers.find(item => item.name === "Transport Layer Security");
+  if (!layer) {
+    const segment = tcpSegments.get(packet);
+    layer = {
+      name: "Transport Layer Security",
+      summary: "Decrypted TLS record",
+      fields: [],
+    };
+    packet.layers.push(layer);
+    if (segment) packet.info = `${segment.sourcePort} → ${segment.destinationPort} TLS Application Data (decrypted)`;
+  }
+  return layer;
+}
+
+function annotateTlsHandshakes(packets) {
+  const flows = new Map();
+  for (const packet of packets) {
+    const segment = tcpSegments.get(packet);
+    if (!segment?.payload.length) continue;
+    const source = `${segment.source}:${segment.sourcePort}`;
+    const destination = `${segment.destination}:${segment.destinationPort}`;
+    const flowKey = [source, destination].sort().join("|");
+    let flow = flows.get(flowKey);
+    if (!flow) {
+      flow = new Map();
+      flows.set(flowKey, flow);
+    }
+    const directionKey = `${source}>${destination}`;
+    if (!flow.has(directionKey)) flow.set(directionKey, []);
+    flow.get(directionKey).push({ ...segment, packet });
+  }
+
+  for (const directions of flows.values()) {
+    for (const segments of directions.values()) {
+      const records = parseTlsRecords(reassembleTcp(segments));
+      const byPacket = new Map();
+      for (const message of decodeTlsHandshakes(records)) {
+        if (!message.packet) continue;
+        if (!byPacket.has(message.packet)) byPacket.set(message.packet, []);
+        byPacket.get(message.packet).push(message);
+      }
+      for (const [packet, messages] of byPacket) {
+        const tlsLayer = getTlsLayer(packet);
+        const messageFields = messages.map(message => field(message.name, message.summary, message.fields));
+        tlsLayer.fields.push(field("Handshake messages", `${messages.length} message${messages.length === 1 ? "" : "s"}`, messageFields));
+        const segment = tcpSegments.get(packet);
+        packet.protocol = "TLS";
+        packet.info = `${segment.sourcePort} → ${segment.destinationPort} ${messages.map(message => message.summary).join("; ")}`;
+        if (!packet.filterTokens.includes("tls")) packet.filterTokens.push("tls");
+      }
+    }
+  }
+}
+
+async function decryptTlsDirection(records, key, fixedIv, subtle) {
+  let cipherActive = false;
+  let sequence = 0n;
+  let decryptedRecords = 0;
+  for (const record of records) {
+    if (record.type === 20) {
+      cipherActive = true;
+      sequence = 0n;
+      continue;
+    }
+    if (!cipherActive) continue;
+    sequence++;
+    if (record.body.length < 24) continue;
+    const explicitNonce = record.body.subarray(0, 8);
+    const encrypted = record.body.subarray(8);
+    const plaintextLength = encrypted.length - 16;
+    const additionalData = concatenateBytes(
+      uint64Bytes(sequence - 1n),
+      Uint8Array.of(record.type),
+      record.version,
+      Uint8Array.of(plaintextLength >> 8, plaintextLength & 0xff),
+    );
+    const iv = concatenateBytes(fixedIv, explicitNonce);
+    let plaintext;
+    try {
+      plaintext = new Uint8Array(await subtle.decrypt(
+        { name: "AES-GCM", iv, additionalData, tagLength: 128 },
+        key,
+        encrypted,
+      ));
+    } catch (error) {
+      if (error?.name === "OperationError") throw new TlsAuthenticationError();
+      throw error;
+    }
+    decryptedRecords++;
+    if (!record.packet) continue;
+    const tlsLayer = getTlsLayer(record.packet);
+    tlsLayer.fields.push(field("Decryption", "Successful"));
+    if (record.type === 23) {
+      const http = readHttp(plaintext);
+      tlsLayer.fields.push(field("Decrypted application data", `${plaintext.length} bytes`));
+      if (http) {
+        record.packet.protocol = "HTTP";
+        record.packet.info = http.summary;
+        if (!record.packet.filterTokens.includes("http")) record.packet.filterTokens.push("http");
+        record.packet.layers.push({
+          name: "Hypertext Transfer Protocol (decrypted)",
+          summary: http.summary,
+          fields: http.fields,
+        });
+      } else {
+        tlsLayer.fields.push(field("Application protocol", "Decrypted; not recognized as HTTP"));
+      }
+    }
+  }
+  return decryptedRecords;
+}
+
+async function decryptEmbeddedTls(packets, keyLogText) {
+  const keyLog = parseTlsKeyLog(keyLogText);
+  if (!keyLog.size) return "Embedded TLS key log contains no supported CLIENT_RANDOM entries.";
+  if (!globalThis.crypto?.subtle) return "TLS decryption requires Web Crypto, which is not available in this browser.";
+  const subtle = globalThis.crypto.subtle;
+  const flows = new Map();
+  for (const packet of packets) {
+    const segment = tcpSegments.get(packet);
+    if (!segment?.payload.length) continue;
+    const source = `${segment.source}:${segment.sourcePort}`;
+    const destination = `${segment.destination}:${segment.destinationPort}`;
+    const flowKey = [source, destination].sort().join("|");
+    let flow = flows.get(flowKey);
+    if (!flow) {
+      flow = new Map();
+      flows.set(flowKey, flow);
+    }
+    const directionKey = `${source}>${destination}`;
+    if (!flow.has(directionKey)) flow.set(directionKey, []);
+    flow.get(directionKey).push({ ...segment, packet });
+  }
+
+  let decryptedRecords = 0;
+  let decryptionWarning = "";
+  for (const directions of flows.values()) {
+    const streams = [...directions].map(([key, segments]) => ({
+      key,
+      stream: reassembleTcp(segments),
+    }));
+    for (const direction of streams) {
+      direction.records = parseTlsRecords(direction.stream);
+      direction.clientHello = readTlsHello(direction.records, 1);
+      direction.serverHello = readTlsHello(direction.records, 2);
+    }
+    const clientDirection = streams.find(direction => direction.clientHello);
+    if (!clientDirection) continue;
+    const clientRandom = Array.from(clientDirection.clientHello.random, byte => byte.toString(16).padStart(2, "0")).join("");
+    const masterSecret = keyLog.get(clientRandom);
+    if (!masterSecret) continue;
+    const serverDirection = streams.find(direction => direction !== clientDirection && direction.serverHello);
+    if (!serverDirection) {
+      decryptionWarning = "An embedded TLS key matched a connection, but its ServerHello was not captured.";
+      continue;
+    }
+    const suite = tls12GcmSuites.get(serverDirection.serverHello.cipherSuite);
+    if (!suite) {
+      decryptionWarning = `Embedded TLS decryption does not support cipher suite 0x${serverDirection.serverHello.cipherSuite.toString(16).padStart(4, "0")}.`;
+      continue;
+    }
+    const keys = await deriveTls12Keys(subtle, masterSecret, clientDirection.clientHello.random, serverDirection.serverHello.random, suite);
+    try {
+      decryptedRecords += await decryptTlsDirection(clientDirection.records, keys.clientKey, keys.clientIv, subtle);
+      decryptedRecords += await decryptTlsDirection(serverDirection.records, keys.serverKey, keys.serverIv, subtle);
+    } catch (error) {
+      if (!(error instanceof TlsAuthenticationError)) throw error;
+      decryptionWarning = "Embedded TLS decryption failed authentication; the key log may not match the capture.";
+    }
+  }
+  if (!decryptedRecords && !decryptionWarning) decryptionWarning = "No TLS connections in this capture matched the embedded key log.";
+  return decryptionWarning;
+}
+
+export async function parseCaptureAsync(input) {
+  const bytes = input instanceof Uint8Array ? input : new Uint8Array(input);
+  const magic = Array.from(bytes.subarray(0, 4)).join(",");
+  const parsed = PCAP_FORMATS[magic]
+    ? parsePcap(bytes)
+    : parsePcapngInternal(bytes, { includeSecrets: true });
+  const { tlsKeyLog, ...capture } = parsed;
+  annotateTlsHandshakes(capture.packets);
+  if (tlsKeyLog) capture.decryptionWarning = await decryptEmbeddedTls(capture.packets, tlsKeyLog);
+  return capture;
 }
 
 export function parsePcap(input) {

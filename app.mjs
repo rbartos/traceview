@@ -1,4 +1,4 @@
-import { parseCapture } from "./pcap.mjs";
+import { parseCaptureAsync } from "./pcap.mjs";
 
 const elements = {
   fileInput: document.querySelector("#file-input"),
@@ -49,7 +49,8 @@ function setCapture(fileName, parsed) {
   selectedNumber = packets[0]?.number ?? null;
   elements.captureName.textContent = fileName;
   const totalBytes = packets.reduce((sum, packet) => sum + packet.length, 0);
-  elements.captureMeta.textContent = `${packets.length.toLocaleString()} packets · ${formatBytes(totalBytes)} · ${parsed.interfaceCount} interface${parsed.interfaceCount === 1 ? "" : "s"}`;
+  const decryptionStatus = parsed.decryptionWarning ? ` · ${parsed.decryptionWarning}` : "";
+  elements.captureMeta.textContent = `${packets.length.toLocaleString()} packets · ${formatBytes(totalBytes)} · ${parsed.interfaceCount} interface${parsed.interfaceCount === 1 ? "" : "s"}${decryptionStatus}`;
   elements.filter.value = "";
   document.querySelectorAll(".filter-chip").forEach(chip => chip.classList.toggle("active", chip.dataset.filter === ""));
   elements.welcome.hidden = true;
@@ -194,7 +195,7 @@ function renderInspectors(packet) {
 async function loadFile(file) {
   if (!file) return;
   try {
-    const parsed = parseCapture(await file.arrayBuffer());
+    const parsed = await parseCaptureAsync(await file.arrayBuffer());
     if (!parsed.packets.length) throw new Error("No supported packet blocks were found in this PCAPNG file.");
     setCapture(file.name, parsed);
   } catch (error) {
@@ -256,7 +257,7 @@ async function loadSample(fileName = sampleFiles[0]) {
     const sampleUrl = new URL(`./samples/${encodeURIComponent(selectedFile)}`, import.meta.url);
     const response = await fetch(sampleUrl);
     if (!response.ok) throw new Error(`Could not load sample capture "${selectedFile}".`);
-    const parsed = parseCapture(await response.arrayBuffer());
+    const parsed = await parseCaptureAsync(await response.arrayBuffer());
     if (!parsed.packets.length) throw new Error(`Sample capture "${selectedFile}" has no supported packet blocks.`);
     setCapture(selectedFile, parsed);
   } catch (error) {

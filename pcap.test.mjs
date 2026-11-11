@@ -1,9 +1,10 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
-import { parseCapture, parsePcapng } from "./pcap.mjs";
+import { parseCapture, parseCaptureAsync, parsePcapng } from "./pcap.mjs";
 
 const sample = await readFile(new URL("./samples/cs725-f26-a3.pcapng", import.meta.url));
+const embeddedKeyLogSample = await readFile(new URL("./samples/cs725-f26-a5-embed.pcapng", import.meta.url));
 const sampleFiles = JSON.parse(await readFile(new URL("./samples/index.json", import.meta.url), "utf8"));
 
 function makeBlock(type, body, littleEndian = true) {
@@ -149,6 +150,54 @@ function tcp(sourcePort, destinationPort, payload) {
   return segment;
 }
 
+function tlsHandshake(type, body) {
+  const handshake = new Uint8Array(4 + body.length);
+  handshake[0] = type;
+  handshake[1] = body.length >> 16;
+  handshake[2] = body.length >> 8;
+  handshake[3] = body.length;
+  handshake.set(body, 4);
+  const record = new Uint8Array(5 + handshake.length);
+  record.set([22, 3, 3, handshake.length >> 8, handshake.length & 0xff]);
+  record.set(handshake, 5);
+  return record;
+}
+
+function tlsExtension(type, data) {
+  return new Uint8Array([type >> 8, type & 0xff, data.length >> 8, data.length & 0xff, ...data]);
+}
+
+function clientHello() {
+  const hostname = new TextEncoder().encode("example.test");
+  const serverName = new Uint8Array([0, 3 + hostname.length, 0, 0, hostname.length, ...hostname]);
+  const alpnName = new TextEncoder().encode("h2");
+  const alpn = new Uint8Array([0, 1 + alpnName.length, alpnName.length, ...alpnName]);
+  const extensions = [
+    tlsExtension(0, serverName),
+    tlsExtension(16, alpn),
+    tlsExtension(43, [4, 3, 4, 3, 3]),
+  ];
+  const extensionLength = extensions.reduce((length, extension) => length + extension.length, 0);
+  const body = new Uint8Array(2 + 32 + 1 + 2 + 4 + 1 + 1 + 2 + extensionLength);
+  let offset = 0;
+  body.set([3, 3], offset);
+  offset += 2;
+  body.set(Array.from({ length: 32 }, (_, index) => index), offset);
+  offset += 32;
+  body[offset++] = 0;
+  body.set([0, 4, 0x13, 1, 0xc0, 0x2f], offset);
+  offset += 6;
+  body.set([1, 0], offset);
+  offset += 2;
+  body[offset++] = extensionLength >> 8;
+  body[offset++] = extensionLength & 0xff;
+  for (const extension of extensions) {
+    body.set(extension, offset);
+    offset += extension.length;
+  }
+  return body;
+}
+
 test("decodes the supplied capture including IPv6 and HTTP", () => {
   const parsed = parsePcapng(sample);
   assert.equal(parsed.packets.length, 10);
@@ -167,6 +216,38 @@ test("sample manifest lists capture files that can be decoded", async () => {
     const bytes = await readFile(new URL(`./samples/${file}`, import.meta.url));
     assert.ok(parseCapture(bytes).packets.length > 0, `${file} should contain supported packets`);
   }
+});
+
+test("decrypts TLS traffic using a PCAPNG-embedded SSLKEYLOG", async () => {
+  assert.equal(parsePcapng(embeddedKeyLogSample).tlsKeyLog, undefined);
+  const parsed = await parseCaptureAsync(embeddedKeyLogSample);
+  const handshakeMessages = parsed.packets.flatMap(packet =>
+    packet.layers.find(layer => layer.name === "Transport Layer Security")?.fields
+      .find(item => item.name === "Handshake messages")?.children ?? []);
+  const decryptedHttp = parsed.packets.filter(packet => packet.protocol === "HTTP");
+  assert.ok(decryptedHttp.some(packet => /GET \//.test(packet.info)));
+  assert.ok(decryptedHttp.some(packet => /^\d{3}\b/.test(packet.info)));
+  assert.match(JSON.stringify(decryptedHttp.flatMap(packet => packet.layers)), /Hypertext Transfer Protocol \(decrypted\)/);
+  assert.ok(handshakeMessages.some(message => message.name === "Client Hello"));
+  assert.ok(handshakeMessages.some(message => message.name === "Server Hello" && /TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384/.test(message.value)));
+  assert.match(JSON.stringify(handshakeMessages), /unh\.edu/);
+  assert.match(JSON.stringify(handshakeMessages), /3 certificates/);
+  assert.ok(handshakeMessages.some(message => message.name === "Server Key Exchange"));
+  assert.equal(parsed.decryptionWarning, "");
+});
+
+test("decodes ClientHello details and common TLS extensions", async () => {
+  const frame = ipv4(6, tcp(52000, 443, tlsHandshake(1, clientHello())));
+  const parsed = await parseCaptureAsync(makeCapture([frame]));
+  const packet = parsed.packets[0];
+  assert.equal(packet.protocol, "TLS");
+  assert.match(packet.info, /Client Hello/);
+  const tlsLayer = packet.layers.find(layer => layer.name === "Transport Layer Security");
+  assert.match(JSON.stringify(tlsLayer.fields), /TLS 1\.2/);
+  assert.match(JSON.stringify(tlsLayer.fields), /TLS_AES_128_GCM_SHA256/);
+  assert.match(JSON.stringify(tlsLayer.fields), /example\.test/);
+  assert.match(JSON.stringify(tlsLayer.fields), /h2/);
+  assert.match(JSON.stringify(tlsLayer.fields), /TLS 1\.3/);
 });
 
 test("decodes Ethernet, IPv4 and UDP fields", () => {

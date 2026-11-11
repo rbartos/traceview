@@ -33,6 +33,9 @@ The filename must be listed in `samples/index.json`.
 Use the display filter or protocol chips to narrow packets. Select a row to
 inspect decoded protocol fields and the raw packet bytes. Capture contents are
 processed entirely on-device and are not uploaded.
+PCAPNG Decryption Secrets Blocks containing an embedded `CLIENT_RANDOM`
+SSLKEYLOG can be used to decrypt supported TLS 1.2 AES-GCM connections locally;
+decrypted HTTP requests and responses are shown in the packet details.
 
 ICMP and ICMPv6 echo, unreachable, time-exceeded, redirect, and related common
 messages include decoded type-specific fields. DNS queries and responses over UDP
